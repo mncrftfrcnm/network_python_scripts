@@ -1,0 +1,7 @@
+interface GigabitEthernet1
+ description {{ UPLINK_DESC }}
+!
+interface GigabitEthernet2
+ description {{ LAN_DESC }}
+!
+message motd # !!! Prohibited !!! #

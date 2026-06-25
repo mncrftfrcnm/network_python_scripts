@@ -1,0 +1,16 @@
+# IOS configuration commands — one block per feature, same format as CLI config mode.
+# Lines starting with # are not valid IOS syntax; remove them before use.
+# Use 'exit' or '!' to close interface/sub-mode blocks.
+
+interface GigabitEthernet1
+ description Uplink to Core
+ ip address 10.0.0.1 255.255.255.0
+ no shutdown
+!
+interface Loopback0
+ description Router ID
+ ip address 192.168.0.1 255.255.255.255
+!
+ip route 0.0.0.0 0.0.0.0 10.0.0.254
+!
+ntp server 192.168.1.100
