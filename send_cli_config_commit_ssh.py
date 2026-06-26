@@ -2,21 +2,23 @@
 """Send raw IOS CLI config with manual commit/confirm flow to Cisco IOS-XE via SSH only.
 
 Flow:
-  1. SSH/SFTP - upload commands file to flash:
-  2. SSH      - backup running-config to flash: (rollback point)
-  3. SSH      - configure EEM applet CONFIG_ROLLBACK as rollback safety net
+  1. SSH      - check free space on bootflash: (abort if below MIN_FLASH_FREE_MB)
+  2. SSH      - backup running-config to bootflash: (rollback point)
+  3. SSH      - enable ip scp server on device
+  4. SCP      - upload commands file to bootflash:
+  5. SSH      - configure EEM applet CONFIG_ROLLBACK as rollback safety net
                (restores backup automatically if no confirmation within CONFIRM_TIMEOUT)
-  4. SSH      - copy flash:<commands> into running-config
-  5. Prompt   - user must confirm within CONFIRM_TIMEOUT seconds
+  6. SSH      - copy bootflash:<commands> into running-config
+  7. Prompt   - user must confirm within CONFIRM_TIMEOUT seconds
                (skipped if AUTOCOMMIT is set - auto yes)
-  6a. Confirmed / autocommit - remove EEM applet, save config, cleanup, done
-  6b. Timeout / No / ^C     - remove EEM applet, rollback, cleanup, exit 1
+  8a. Confirmed / autocommit - remove EEM applet, save config, cleanup, done
+  8b. Timeout / No / ^C     - remove EEM applet, rollback, cleanup, exit 1
 
 Rollback-only flow (ROLLBACK_ONLY / --rollback-only):
   No upload, no backup, no EEM configure, no apply.
   1. SSH - remove EEM applet
-  2. SSH - configure replace flash:<backup> (rollback)
-  3. SSH - delete commands file from flash: (backup file is preserved)
+  2. SSH - configure replace bootflash:<backup> (rollback)
+  3. SSH - delete commands file from bootflash: (backup file is preserved)
 
 Usage:
     python send_cli_config_commit_ssh.py [commands_file] [-y]
@@ -30,10 +32,12 @@ Environment variables (or .env file):
     NO_CLEAN_BACKUP        - set to any non-empty value to keep backup file on flash after run
     NO_ROLLBACK_SCRIPT     - set to any non-empty value to skip EEM applet creation and removal
     ROLLBACK_ONLY          - set to any non-empty value to skip upload/apply and only rollback
+    MIN_FLASH_FREE_MB      - minimum required free space on bootflash: in MB (default: 50)
 """
 
 import argparse
 import os
+import re
 import sys
 import select
 import tempfile
@@ -48,6 +52,7 @@ load_dotenv()
 
 REMOTE_CONFIG_FILE = "automation_cli_push.txt"
 REMOTE_BACKUP_FILE = "automation_cli_backup.cfg"
+MIN_FLASH_FREE_MB = int(os.environ.get("MIN_FLASH_FREE_MB", "50"))
 CONFIRM_TIMEOUT = int(os.environ.get("DEVICE_CONFIRM_TIMEOUT", "300"))
 EEM_APPLET_NAME = "CONFIG_ROLLBACK"
 
@@ -85,19 +90,36 @@ def _new_ssh(host: str, username: str, password: str) -> paramiko.SSHClient:
     return ssh
 
 
-def upload_file(host: str, username: str, password: str, local_path: str) -> None:
-    ssh = _new_ssh(host, username, password)
-    try:
-        sftp = ssh.open_sftp()
-        sftp.put(local_path, REMOTE_CONFIG_FILE)
-        sftp.close()
-        print("Uploaded via SFTP.")
-        return
-    except Exception as e:
-        print(f"SFTP unavailable ({e}), trying SCP ...")
-    finally:
-        ssh.close()
+def _detect_os(host: str, username: str, password: str) -> str:
+    """Return 'nxos' or 'iosxe' based on show version output."""
+    output = _ssh_exec(host, username, password, "show version")
+    if "NX-OS" in output or "Nexus" in output:
+        return "nxos"
+    return "iosxe"
 
+
+def enable_scp_server(host: str, username: str, password: str) -> None:
+    os_type = _detect_os(host, username, password)
+    if os_type == "nxos":
+        _ssh_exec(host, username, password, "configure terminal\nfeature scp-server\nend")
+    else:
+        _ssh_exec(host, username, password, "configure terminal\nip scp server enable\nend")
+    print(f"SCP server enabled ({os_type}).")
+
+
+def check_flash_space(host: str, username: str, password: str, required_mb: int = MIN_FLASH_FREE_MB) -> None:
+    """Check free space on bootflash:. Exit with error if below required_mb."""
+    output = _ssh_exec(host, username, password, "terminal length 0\ndir bootflash:")
+    match = re.search(r"(\d+)\s+bytes free", output)
+    if not match:
+        sys.exit("ERROR: could not determine free space on bootflash: — aborting.")
+    free_mb = int(match.group(1)) // (1024 * 1024)
+    print(f"Flash free space: {free_mb} MB (required: {required_mb} MB)")
+    if free_mb < required_mb:
+        sys.exit(f"ERROR: not enough space on bootflash: — {free_mb} MB free, {required_mb} MB required.")
+
+
+def upload_file(host: str, username: str, password: str, local_path: str) -> None:
     ssh = _new_ssh(host, username, password)
     try:
         with SCPClient(ssh.get_transport()) as scp:
@@ -135,7 +157,7 @@ def ssh_copy(host: str, username: str, password: str, src: str, dst: str) -> Non
 
 
 def ssh_delete(host: str, username: str, password: str, filename: str) -> None:
-    _ssh_exec(host, username, password, f"delete /force flash:{filename}")
+    _ssh_exec(host, username, password, f"delete /force bootflash:{filename}")
 
 
 def configure_eem_rollback(host: str, username: str, password: str, timeout_seconds: int) -> None:
@@ -145,7 +167,7 @@ def configure_eem_rollback(host: str, username: str, password: str, timeout_seco
         f" event timer countdown time {timeout_seconds + 30}",
         f' action 1.0 syslog msg "{EEM_APPLET_NAME}: no confirmation received - restoring backup"',
         ' action 2.0 cli command "enable"',
-        f' action 3.0 cli command "configure replace flash:{REMOTE_BACKUP_FILE} force"',
+        f' action 3.0 cli command "configure replace bootflash:{REMOTE_BACKUP_FILE} force"',
         "end",
     ])
     _ssh_exec(host, username, password, config)
@@ -171,7 +193,7 @@ def confirm_with_timeout(timeout: int) -> bool | None:
 
 def rollback(host: str, username: str, password: str) -> None:
     print("Rolling back to saved backup ...")
-    _ssh_exec(host, username, password, f"configure replace flash:{REMOTE_BACKUP_FILE} force")
+    _ssh_exec(host, username, password, f"configure replace bootflash:{REMOTE_BACKUP_FILE} force")
     print("Rollback complete.")
 
 
@@ -182,12 +204,12 @@ def save_config(host: str, username: str, password: str) -> None:
 
 
 def cleanup(host: str, username: str, password: str, keep_backup: bool = False) -> None:
-    print("Cleaning up temp files from flash: ...")
+    print("Cleaning up temp files from bootflash: ...")
     ssh_delete(host, username, password, REMOTE_CONFIG_FILE)
     if not keep_backup:
         ssh_delete(host, username, password, REMOTE_BACKUP_FILE)
     else:
-        print(f"  keeping flash:{REMOTE_BACKUP_FILE}")
+        print(f"  keeping bootflash:{REMOTE_BACKUP_FILE}")
     print("Done.")
 
 
@@ -215,31 +237,37 @@ if __name__ == "__main__":
         print("\nRollback-only mode: removing EEM applet and restoring backup ...")
         remove_eem_rollback(host, username, password)
         rollback(host, username, password)
-        print("Cleaning up commands file from flash: (backup preserved) ...")
+        print("Cleaning up commands file from bootflash: (backup preserved) ...")
         ssh_delete(host, username, password, REMOTE_CONFIG_FILE)
         print("Done.")
         sys.exit(0)
 
     commands_file = args.commands_file or os.environ.get("DEVICE_CONFIG_FILE") or input("Commands file path: ").strip()
 
+    print("\nChecking available flash space ...")
+    check_flash_space(host, username, password)
+
+    print(f"\nBacking up running-config to bootflash:{REMOTE_BACKUP_FILE} ...")
+    ssh_copy(host, username, password, "running-config", f"bootflash:{REMOTE_BACKUP_FILE}")
+    print("Backup done.")
+
+    print("\nEnabling ip scp server ...")
+    enable_scp_server(host, username, password)
+
     upload_path, is_temp = render_template(commands_file)
     try:
-        print(f"\nUploading {commands_file!r} to {host}:flash:{REMOTE_CONFIG_FILE} ...")
+        print(f"\nUploading {commands_file!r} to {host}:bootflash:{REMOTE_CONFIG_FILE} ...")
         upload_file(host, username, password, upload_path)
         print("Upload complete.")
     finally:
         if is_temp:
             os.unlink(upload_path)
 
-    print(f"\nBacking up running-config to flash:{REMOTE_BACKUP_FILE} ...")
-    ssh_copy(host, username, password, "running-config", f"flash:{REMOTE_BACKUP_FILE}")
-    print("Backup done.")
-
     if not no_rollback_script:
         configure_eem_rollback(host, username, password, CONFIRM_TIMEOUT)
 
-    print(f"\nApplying flash:{REMOTE_CONFIG_FILE} to running-config ...")
-    ssh_copy(host, username, password, f"flash:{REMOTE_CONFIG_FILE}", "running-config")
+    print(f"\nApplying bootflash:{REMOTE_CONFIG_FILE} to running-config ...")
+    ssh_copy(host, username, password, f"bootflash:{REMOTE_CONFIG_FILE}", "running-config")
 
     if autocommit:
         confirmed = True

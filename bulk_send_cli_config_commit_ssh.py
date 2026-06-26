@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from dotenv import load_dotenv
-from connect_params import env_bool
+from connect_params import env_bool, get_shared_credentials
 
 load_dotenv()
 
@@ -76,7 +76,7 @@ if __name__ == "__main__":
         print(f"No devices found in {args.devices_file}")
         sys.exit(1)
 
-    extra_env: dict[str, str] = {}
+    extra_env: dict[str, str] = get_shared_credentials()
     if args.autocommit:
         extra_env["AUTOCOMMIT"] = "1"
     if args.rollback_only:

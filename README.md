@@ -1,6 +1,6 @@
 # network_python_scripts
 
-Python scripts for configuring Cisco IOS-XE network devices over SSH.
+Python scripts for configuring Cisco IOS-XE and NX-OS network devices over SSH.
 
 ## Requirements
 
@@ -23,6 +23,7 @@ AUTOCOMMIT=        # enable to skip confirmation prompt
 NO_CLEAN_BACKUP=   # enable to keep backup file on flash after run
 NO_ROLLBACK_SCRIPT= # enable to skip EEM applet creation and removal
 ROLLBACK_ONLY=     # enable to skip upload/apply and only rollback
+MIN_FLASH_FREE_MB=50 # minimum required free space on flash (default: 50)
 
 # bulk_send_cli_config_commit_ssh.py
 DEVICES_FILE=devices_list.txt   # file with device IPs, one per line
@@ -40,11 +41,13 @@ Boolean variables accept `1`/`true`/`yes` to enable and `0`/`false`/`no` to disa
 Pushes a CLI config file to a device with a confirm/rollback flow.
 
 **Flow:**
-1. Upload commands file to device flash via SFTP/SCP
+1. Check free space on `bootflash:` — abort if below `MIN_FLASH_FREE_MB`
 2. Backup running-config to flash (rollback point)
-3. Configure EEM applet `CONFIG_ROLLBACK` as safety net
-4. Apply commands file to running-config
-5. Prompt user to confirm within `DEVICE_CONFIRM_TIMEOUT` seconds
+3. Enable SCP server on device (`ip scp server enable` on IOS-XE, `feature scp-server` on NX-OS)
+4. Upload commands file to device flash via SCP
+5. Configure EEM applet `CONFIG_ROLLBACK` as safety net
+6. Apply commands file to running-config
+7. Prompt user to confirm within `DEVICE_CONFIRM_TIMEOUT` seconds
    - **Confirmed** - remove EEM applet, save config, cleanup
    - **No / Ctrl+C** - immediate rollback via `configure replace`, cleanup
    - **Timeout** - EEM applet triggers rollback automatically, cleanup
@@ -56,11 +59,13 @@ python send_cli_config_commit_ssh.py [commands_file] [-y]
 
 Use `-y` / `--autocommit` (or set `AUTOCOMMIT=1` in `.env`) to skip the confirmation prompt and save immediately. EEM safety net is still active.
 
-Use `--no-clean-backup` (or set `NO_CLEAN_BACKUP=1` in `.env`) to keep `flash:automation_cli_backup.cfg` after the run (useful for manual inspection or recovery).
+Use `--no-clean-backup` (or set `NO_CLEAN_BACKUP=1` in `.env`) to keep `bootflash:automation_cli_backup.cfg` after the run (useful for manual inspection or recovery).
 
 Use `--no-rollback-script` (or set `NO_ROLLBACK_SCRIPT=1` in `.env`) to skip EEM applet creation and removal entirely.
 
-Use `--rollback-only` (or set `ROLLBACK_ONLY=1` in `.env`) to skip upload/backup/apply entirely and just remove the EEM applet and restore the previously saved backup (`flash:automation_cli_backup.cfg`). The backup file is preserved on flash after the run.
+Use `--rollback-only` (or set `ROLLBACK_ONLY=1` in `.env`) to skip upload/backup/apply entirely and just remove the EEM applet and restore the previously saved backup (`bootflash:automation_cli_backup.cfg`). The backup file is preserved on bootflash after the run.
+
+Set `MIN_FLASH_FREE_MB` (default: `50`) to control the minimum free space required on `bootflash:` before the script proceeds. The script aborts with an error if the device has less free space than this threshold.
 
 Commands file supports Jinja2 templates with env vars as context:
 ```

@@ -29,6 +29,13 @@ def env_bool(name: str) -> bool:
     sys.exit(f"error: {name}={val!r} is not valid. Use 1/true/yes to enable or 0/false/no to disable.")
 
 
+def get_shared_credentials() -> dict[str, str]:
+    """Return username and password from env vars, falling back to interactive prompts."""
+    username = os.environ.get("DEVICE_USERNAME") or input("Username: ").strip()
+    password = os.environ.get("DEVICE_PASSWORD") or getpass.getpass("Password: ")
+    return {"DEVICE_USERNAME": username, "DEVICE_PASSWORD": password}
+
+
 def get_device_params(require_port: bool = False) -> dict:
     """Return connection params from env vars, falling back to interactive prompts."""
     ip = os.environ.get("DEVICE_IP") or input("Device IP: ").strip()
